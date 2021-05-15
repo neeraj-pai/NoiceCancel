@@ -4,6 +4,12 @@
 #include <mmsystem.h>
 #include <fstream>
 #include <iostream>
+#include <cstdlib>
+#include <ctime>
+
+//Credit to http://www.techmind.org/wave/ and 
+//http://bcbjournal.org/articles/vol2/9808/Low-level_wave_audio__part_2.htm
+//for the APIs explanation
 
 //Noise cancelling application
 //System design
@@ -39,6 +45,114 @@ HWAVEOUT wo;
 CONDITION_VARIABLE BufferNotEmpty;
 CRITICAL_SECTION   BufferLock;
 BOOL bContinue;
+
+#define FILTER_TAP 16
+#define MU 0.5f
+#define BATCH_SIZE 32
+
+float fLMSFilterCoefficients[FILTER_TAP];
+float nOut[BATCH_SIZE];//doing in float for more precision
+float nError[BATCH_SIZE];
+float nFilterIncrement[BATCH_SIZE];
+
+void ComputeAntiNoise(char *nInput, char *nOutput, int nPixels)
+{
+	//compute output from input
+	int nSample,nFilterTap, nBatchIndex;
+	for (nSample = 0; nSample < nPixels; nSample += BATCH_SIZE)
+	{
+		for (nFilterTap = 0; nFilterTap < FILTER_TAP; nFilterTap++)
+		{
+			nFilterIncrement[nFilterTap] = 0;
+		}
+		for (nBatchIndex = 0; nBatchIndex < BATCH_SIZE; nBatchIndex++)
+		{
+			nOut[nBatchIndex] = 0;
+			int nCurrentSample = nBatchIndex + nSample;
+			for (nFilterTap = 0; nFilterTap < FILTER_TAP; nFilterTap++)
+			{
+				if (nCurrentSample - nFilterTap >= 0)
+				{
+					nOut[nBatchIndex] += (float)nInput[nCurrentSample - nFilterTap]
+						* fLMSFilterCoefficients[nFilterTap];
+				}
+			}
+
+			//E = D - Y;
+			//since desired signal is no sound so = 0;
+			//so error = -output
+			nError[nBatchIndex] = -nOut[nBatchIndex];
+			nOutput[nCurrentSample] = (int16_t)nOut;
+
+			//update filter increment
+			for (nFilterTap = 0; nFilterTap < FILTER_TAP; nFilterTap++)
+			{
+				if (nCurrentSample - nFilterTap >= 0)
+				{
+					nFilterIncrement[nFilterTap] +=
+						MU * nError[nBatchIndex] * nInput[nCurrentSample - nFilterTap];					
+				}
+			}
+
+		}
+
+		for (nFilterTap = 0; nFilterTap < FILTER_TAP; nFilterTap++)
+		{
+			fLMSFilterCoefficients[nFilterTap] += nFilterIncrement[nFilterTap] / BATCH_SIZE;
+		}
+	}
+	
+		
+
+#if 0
+	//intial phase with less than FILTER_TAP samples
+	for (nSample = 1; nSample < FILTER_TAP + 1; nSample++)
+	{
+		nOutput[nSample - 1] = 0;
+		// 0 = 0 * 0
+		// 1 = 1 * 0 + 0 * 1
+		// 2 = 2 * 0 + 1 * 1 + 0 * 2
+		// 3 = 3 * 0 + 2 * 1 + 1 * 2 + 0 * 3
+		for (int nComp = 0; nComp < nSample; nComp++)
+		{
+			nOutput[nSample - 1] += (char)((float)nInput[nComp] * 
+				fLMSFilterCoefficients[nSample - nComp - 1]);
+		}
+	}
+	
+	//middle phase all samples 
+	//use the FILTER_TAP previous sample to compute input
+	for (nSample = FILTER_TAP + 1; nSample < nPixels - FILTER_TAP; nSample++)
+	{
+		nOutput[nSample - 1] = 0;
+		//nSample - 1 = 32
+		for (int nComp = nSample - FILTER_TAP; nComp < nSample; nComp++)
+		{
+			nOutput[nSample - 1] += (char)((float)nInput[nComp] *
+				fLMSFilterCoefficients[nSample - nComp - 1]);
+		}
+	}
+
+	//last phase
+	for (nSample = nPixels - FILTER_TAP; nSample < nPixels + 1; nSample++)
+	{
+		nOutput[nSample - 1] = 0;
+
+		for (int nComp = nSample; nComp < nPixels; nComp++)
+		{
+			nOutput[nSample - 1] += (char)((float)nInput[nComp] *
+				fLMSFilterCoefficients[nSample - nComp - 1]);
+		}
+	}
+#endif
+	//reference output is all 0
+	//x(n) is input
+	//e(n) = 0 - y(n)
+	//mu is constant
+	//w(n + 1) = w(n) + mu * x(n) * e(n)
+
+
+}
 
 //4 threads since we have 4 processors
 DWORD WINAPI myProcessThread(LPVOID lpParameter)
@@ -83,8 +197,9 @@ DWORD WINAPI myProcessThread(LPVOID lpParameter)
 
 		LeaveCriticalSection(&BufferLock);
 
-		//eventually process for now do memcpy
-		memcpy(pWritePtr, pReadPtr, SAMPLE_RATE * NUM_CHANNELS * BYTES_OUT/8);
+		//compute anti noise
+		ComputeAntiNoise(pReadPtr, pWritePtr, SAMPLE_RATE * NUM_CHANNELS * BYTES_OUT / 8);
+		//memcpy(pWritePtr, pReadPtr, SAMPLE_RATE * NUM_CHANNELS * BYTES_OUT/8);
 
 		//submit write buffer to be played back
 		//waveOutPrepareHeader(wo, &playback_headers[nWriteCnt], sizeof(playback_headers[nWriteCnt]));
@@ -279,9 +394,15 @@ void InitializeNoCallBack()
 {
 	//Initialize record 
 
-	//same handle used for both
-	// Fill the WAVEFORMATEX struct to indicate the format of our recorded audio
-	//   For this example we'll use "CD quality", ie:  44100 Hz, stereo, 16-bit
+	//initial weights for filter
+	srand(static_cast <unsigned> (time(0)));
+	for(int nFiltertap = 0;nFiltertap < FILTER_TAP;nFiltertap++)
+	{
+		fLMSFilterCoefficients[nFiltertap] = 
+			(float)((rand() << 15 + rand()) & ((1 << 24) - 1)) / (1 << 24);
+	}
+	
+	
 	WAVEFORMATEX wfx = {};
 	wfx.wFormatTag = WAVE_FORMAT_PCM;       // PCM is standard
 	wfx.nChannels = 2;                      // 2 channels = stereo sound
